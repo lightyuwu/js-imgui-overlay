@@ -244,7 +244,7 @@
 			ImGuiImplWeb.BeginRender();
 
 			// Built-in demo window.
-			ImGui.ShowDemoWindow();
+			// ImGui.ShowDemoWindow();
 
 			// Custom render callback.
 			if (renderCallback) {
