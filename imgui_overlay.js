@@ -1,10 +1,63 @@
 
-(async () => {
+(function () {
+	"use strict";
+
+	// ============================================
+	// Shared loader state
+	// ============================================
+
+	const state = window.__imOverlayState ??= {
+		api: null,
+		loading: false,
+		listeners: new Set(),
+		errorListeners: new Set(),
+		error: null
+	};
+
+	// ============================================
+	// External load listeners
+	// ============================================
+
+	window.onImGuiLoaded = function (handler) {
+		if (typeof handler !== "function")
+			throw new TypeError("Expected a function");
+
+		if (state.api) {
+			queueMicrotask(() => {
+				try {
+					handler(state.api);
+				} catch (error) {
+					console.error("[ImOverlay] Load listener error:", error);
+				}
+			});
+
+			return () => {};
+		}
+
+		state.listeners.add(handler);
+
+		return () => state.listeners.delete(handler);
+	};
+
+	window.onImGuiLoadError = function (handler) {
+		if (typeof handler !== "function")
+			throw new TypeError("Expected a function");
+
+		if (state.error) {
+			queueMicrotask(() => handler(state.error));
+			return () => {};
+		}
+
+		state.errorListeners.add(handler);
+
+		return () => state.errorListeners.delete(handler);
+	};
+
 	// ============================================
 	// Configuration
 	// ============================================
 
-	const VERSION = "3.0.0";
+	const VERSION = "3.1.0";
 	const LIBRARY = "https://esm.sh/@mori2003/jsimgui@0.14.0";
 
 	// ============================================
@@ -18,324 +71,413 @@
 	);
 
 	// ============================================
-	// Instance management
+	// Initialization
 	// ============================================
 
-	if (window.__imguiOverlay) {
-		window.__imguiOverlay.destroy();
-	}
-
-	log(`Initializing v${VERSION}...`);
-
-	const { ImGui, ImGuiImplWeb } = await import(LIBRARY);
-
-	// ============================================
-	// Canvas
-	// ============================================
-
-	const canvas = document.createElement("canvas");
-
-	canvas.id = "__imgui_overlay";
-	canvas.tabIndex = -1;
-
-	Object.assign(canvas.style, {
-		position: "fixed",
-		inset: "0",
-		width: "100vw",
-		height: "100vh",
-		zIndex: "2147483647",
-		pointerEvents: "none",
-		background: "transparent",
-		display: "block"
-	});
-
-	document.documentElement.appendChild(canvas);
-
-	try {
-		await ImGuiImplWeb.Init({
-			canvas,
-			backend: "webgl2"
-		});
-	} catch (error) {
-		canvas.remove();
-		throw error;
-	}
-
-	// ============================================
-	// State
-	// ============================================
-
-	const io = ImGui.GetIO();
-
-	let running = true;
-	let enabled = true;
-	let frame = 0;
-	let animationFrame = 0;
-	let renderCallback = null;
-
-	const capturedButtons = new Set();
-
-	// ============================================
-	// Enable / Disable
-	// ============================================
-
-	function setEnabled(value) {
-		value = Boolean(value);
-
-		if (enabled === value)
+	async function initialize() {
+		if (state.loading) {
+			log("Already initializing.");
 			return;
+		}
 
-		enabled = value;
+		if (window.__imguiOverlay) {
+			window.__imguiOverlay.destroy();
+		}
 
-		if (!enabled) {
-			// Release any currently captured buttons.
-			for (const button of capturedButtons) {
-				io.AddMouseButtonEvent(button, false);
+		state.api = null;
+		state.error = null;
+		state.loading = true;
+
+		let resolveReady;
+		let rejectReady;
+
+		const readyPromise = new Promise((resolve, reject) => {
+			resolveReady = resolve;
+			rejectReady = reject;
+		});
+
+		// Avoid unhandled rejection warnings if nobody
+		// is currently awaiting the readiness promise.
+		readyPromise.catch(() => {});
+
+		window.ImOverlayReady = readyPromise;
+
+		log(`Initializing v${VERSION}...`);
+
+		let canvas = null;
+
+		try {
+			// ========================================
+			// Load dependency
+			// ========================================
+
+			const { ImGui, ImGuiImplWeb } = await import(LIBRARY);
+
+			// ========================================
+			// Canvas
+			// ========================================
+
+			canvas = document.createElement("canvas");
+
+			canvas.id = "__imgui_overlay";
+			canvas.tabIndex = -1;
+
+			Object.assign(canvas.style, {
+				position: "fixed",
+				inset: "0",
+				width: "100vw",
+				height: "100vh",
+				zIndex: "2147483647",
+				pointerEvents: "none",
+				background: "transparent",
+				display: "block"
+			});
+
+			document.documentElement.appendChild(canvas);
+
+			await ImGuiImplWeb.Init({
+				canvas,
+				backend: "webgl2"
+			});
+
+			// ========================================
+			// State
+			// ========================================
+
+			const io = ImGui.GetIO();
+
+			let running = true;
+			let enabled = true;
+			let frame = 0;
+			let animationFrame = 0;
+			let renderCallback = null;
+
+			const capturedButtons = new Set();
+
+			// ========================================
+			// Enable / Disable
+			// ========================================
+
+			function setEnabled(value) {
+				value = Boolean(value);
+
+				if (enabled === value)
+					return;
+
+				enabled = value;
+
+				if (!enabled) {
+					for (const button of capturedButtons) {
+						io.AddMouseButtonEvent(button, false);
+					}
+
+					capturedButtons.clear();
+					io.AddMousePosEvent(-1, -1);
+				}
+
+				canvas.style.display = enabled ? "block" : "none";
+
+				log(`Overlay ${enabled ? "enabled" : "disabled"}.`);
 			}
 
-			capturedButtons.clear();
+			function toggle() {
+				setEnabled(!enabled);
+			}
 
-			// Move mouse outside ImGui.
-			io.AddMousePosEvent(-1, -1);
-		}
+			// ========================================
+			// Input handling
+			// ========================================
 
-		canvas.style.display = enabled ? "block" : "none";
+			function mousePosition(event) {
+				io.AddMousePosEvent(
+					event.clientX,
+					event.clientY
+				);
+			}
 
-		log(`Overlay ${enabled ? "enabled" : "disabled"}.`);
-	}
+			function shouldCaptureMouse() {
+				return enabled && (
+					io.WantCaptureMouse ||
+					capturedButtons.size > 0
+				);
+			}
 
-	function toggle() {
-		setEnabled(!enabled);
-	}
+			function consume(event) {
+				event.preventDefault();
+				event.stopPropagation();
+				event.stopImmediatePropagation();
+			}
 
-	// ============================================
-	// Input handling
-	// ============================================
+			function onPointerMove(event) {
+				if (!enabled)
+					return;
 
-	function mousePosition(event) {
-		io.AddMousePosEvent(
-			event.clientX,
-			event.clientY
-		);
-	}
+				mousePosition(event);
+			}
 
-	function shouldCaptureMouse() {
-		return enabled && (
-			io.WantCaptureMouse ||
-			capturedButtons.size > 0
-		);
-	}
+			function onPointerDown(event) {
+				if (!enabled)
+					return;
 
-	function consume(event) {
-		event.preventDefault();
-		event.stopPropagation();
-		event.stopImmediatePropagation();
-	}
+				mousePosition(event);
 
-	function onPointerMove(event) {
-		if (!enabled)
-			return;
+				if (!shouldCaptureMouse())
+					return;
 
-		mousePosition(event);
-	}
+				consume(event);
 
-	function onPointerDown(event) {
-		if (!enabled)
-			return;
+				capturedButtons.add(event.button);
+				io.AddMouseButtonEvent(event.button, true);
+			}
 
-		mousePosition(event);
+			function onPointerUp(event) {
+				if (!enabled || !capturedButtons.has(event.button))
+					return;
 
-		if (!shouldCaptureMouse())
-			return;
+				mousePosition(event);
+				consume(event);
 
-		consume(event);
+				capturedButtons.delete(event.button);
+				io.AddMouseButtonEvent(event.button, false);
+			}
 
-		capturedButtons.add(event.button);
+			function onPointerCancel() {
+				for (const button of capturedButtons) {
+					io.AddMouseButtonEvent(button, false);
+				}
 
-		io.AddMouseButtonEvent(event.button, true);
-	}
+				capturedButtons.clear();
+			}
 
-	function onPointerUp(event) {
-		if (!enabled || !capturedButtons.has(event.button))
-			return;
+			function onWheel(event) {
+				if (!shouldCaptureMouse())
+					return;
 
-		mousePosition(event);
-		consume(event);
+				consume(event);
 
-		capturedButtons.delete(event.button);
+				const multiplier = event.deltaMode === 1
+					? 0.1
+					: event.deltaMode === 2
+						? 1
+						: 0.01;
 
-		io.AddMouseButtonEvent(event.button, false);
-	}
+				io.AddMouseWheelEvent(
+					-event.deltaX * multiplier,
+					-event.deltaY * multiplier
+				);
+			}
 
-	function onPointerCancel() {
-		for (const button of capturedButtons) {
-			io.AddMouseButtonEvent(button, false);
-		}
+			// ========================================
+			// Keyboard handling
+			// ========================================
 
-		capturedButtons.clear();
-	}
+			function onKeyDown(event) {
+				if (event.code !== "Insert" || event.repeat)
+					return;
 
-	function onWheel(event) {
-		if (!shouldCaptureMouse())
-			return;
+				consume(event);
+				toggle();
+			}
 
-		consume(event);
+			// ========================================
+			// Event registration
+			// ========================================
 
-		const multiplier = event.deltaMode === 1
-			? 0.1
-			: event.deltaMode === 2
-				? 1
-				: 0.01;
+			window.addEventListener("pointermove", onPointerMove, true);
+			window.addEventListener("pointerdown", onPointerDown, true);
+			window.addEventListener("pointerup", onPointerUp, true);
+			window.addEventListener("pointercancel", onPointerCancel, true);
 
-		io.AddMouseWheelEvent(
-			-event.deltaX * multiplier,
-			-event.deltaY * multiplier
-		);
-	}
+			window.addEventListener("wheel", onWheel, {
+				capture: true,
+				passive: false
+			});
 
-	// ============================================
-	// Keyboard handling
-	// ============================================
+			window.addEventListener("keydown", onKeyDown, true);
 
-	function onKeyDown(event) {
-		if (event.code !== "Insert" || event.repeat)
-			return;
+			// ========================================
+			// Rendering
+			// ========================================
 
-		consume(event);
-		toggle();
-	}
+			function render() {
+				if (!running)
+					return;
 
-	// ============================================
-	// Event registration
-	// ============================================
+				if (enabled) {
+					const dpr = window.devicePixelRatio || 1;
 
-	window.addEventListener("pointermove", onPointerMove, true);
-	window.addEventListener("pointerdown", onPointerDown, true);
-	window.addEventListener("pointerup", onPointerUp, true);
-	window.addEventListener("pointercancel", onPointerCancel, true);
+					const width = Math.round(window.innerWidth * dpr);
+					const height = Math.round(window.innerHeight * dpr);
 
-	window.addEventListener("wheel", onWheel, {
-		capture: true,
-		passive: false
-	});
+					if (canvas.width !== width)
+						canvas.width = width;
 
-	window.addEventListener("keydown", onKeyDown, true);
+					if (canvas.height !== height)
+						canvas.height = height;
 
-	// ============================================
-	// Rendering
-	// ============================================
+					ImGuiImplWeb.BeginRender();
 
-	function render() {
-		if (!running)
-			return;
+					// Built-in demo window.
+					// ImGui.ShowDemoWindow();
 
-		if (enabled) {
-			const dpr = window.devicePixelRatio || 1;
+					// Custom render callback.
+					if (renderCallback) {
+						try {
+							renderCallback(ImGui);
+						} catch (error) {
+							log(`Render callback error: ${error}`);
+							console.error(error);
+						}
+					}
 
-			const width = Math.round(window.innerWidth * dpr);
-			const height = Math.round(window.innerHeight * dpr);
+					ImGuiImplWeb.EndRender();
 
-			if (canvas.width !== width)
-				canvas.width = width;
+					frame++;
+				}
 
-			if (canvas.height !== height)
-				canvas.height = height;
+				animationFrame = requestAnimationFrame(render);
+			}
 
-			ImGuiImplWeb.BeginRender();
+			// ========================================
+			// Public API
+			// ========================================
 
-			// Built-in demo window.
-			// ImGui.ShowDemoWindow();
+			const api = {
+				version: VERSION,
+				ImGui,
+				canvas,
+				log,
 
-			// Custom render callback.
-			if (renderCallback) {
+				get io() {
+					return io;
+				},
+
+				get frame() {
+					return frame;
+				},
+
+				get enabled() {
+					return enabled;
+				},
+
+				get onRender() {
+					return renderCallback;
+				},
+
+				set onRender(callback) {
+					if (callback !== null && typeof callback !== "function")
+						throw new TypeError("Expected a function or null");
+
+					renderCallback = callback;
+				},
+
+				toggle,
+				setEnabled,
+
+				destroy() {
+					if (!running)
+						return;
+
+					running = false;
+
+					cancelAnimationFrame(animationFrame);
+
+					for (const button of capturedButtons) {
+						io.AddMouseButtonEvent(button, false);
+					}
+
+					capturedButtons.clear();
+
+					window.removeEventListener("pointermove", onPointerMove, true);
+					window.removeEventListener("pointerdown", onPointerDown, true);
+					window.removeEventListener("pointerup", onPointerUp, true);
+					window.removeEventListener("pointercancel", onPointerCancel, true);
+					window.removeEventListener("wheel", onWheel, true);
+					window.removeEventListener("keydown", onKeyDown, true);
+
+					canvas.remove();
+
+					if (window.__imguiOverlay === api) {
+						delete window.__imguiOverlay;
+					}
+
+					if (state.api === api) {
+						state.api = null;
+					}
+
+					log("Overlay destroyed.");
+				}
+			};
+
+			// ========================================
+			// Publish API
+			// ========================================
+
+			window.__imguiOverlay = api;
+
+			state.api = api;
+			state.loading = false;
+
+			// Start rendering.
+			animationFrame = requestAnimationFrame(render);
+
+			log("Initialized!");
+			log("Press INSERT to toggle.");
+			log("API: window.__imguiOverlay");
+
+			// ========================================
+			// Notify listeners
+			// ========================================
+
+			for (const handler of state.listeners) {
 				try {
-					renderCallback(ImGui);
+					handler(api);
 				} catch (error) {
-					log(`Render callback error: ${error}`);
+					log("Load listener error.");
+					console.error(error);
 				}
 			}
 
-			ImGuiImplWeb.EndRender();
+			state.listeners.clear();
 
-			frame++;
+			window.dispatchEvent(
+				new CustomEvent("imoverlay:loaded", {
+					detail: api
+				})
+			);
+
+			resolveReady(api);
+
+			return api;
+
+		} catch (error) {
+			if (canvas)
+				canvas.remove();
+
+			state.loading = false;
+			state.api = null;
+			state.error = error;
+
+			log("Initialization failed.");
+			console.error(error);
+
+			for (const handler of state.errorListeners) {
+				try {
+					handler(error);
+				} catch (listenerError) {
+					console.error("[ImOverlay] Error listener failed:", listenerError);
+				}
+			}
+
+			rejectReady(error);
+
+			throw error;
 		}
-
-		animationFrame = requestAnimationFrame(render);
 	}
 
 	// ============================================
-	// Public API
+	// Start initialization
 	// ============================================
 
-	const api = {
-		ImGui,
-		canvas,
-		log,
-
-		get io() {
-			return io;
-		},
-
-		get frame() {
-			return frame;
-		},
-
-		get enabled() {
-			return enabled;
-		},
-
-		get onRender() {
-			return renderCallback;
-		},
-
-		set onRender(callback) {
-			if (callback !== null && typeof callback !== "function")
-				throw new TypeError("Expected a function or null");
-
-			renderCallback = callback;
-		},
-
-		toggle,
-		setEnabled,
-
-		destroy() {
-			if (!running)
-				return;
-
-			running = false;
-
-			cancelAnimationFrame(animationFrame);
-
-			for (const button of capturedButtons) {
-				io.AddMouseButtonEvent(button, false);
-			}
-
-			capturedButtons.clear();
-
-			window.removeEventListener("pointermove", onPointerMove, true);
-			window.removeEventListener("pointerdown", onPointerDown, true);
-			window.removeEventListener("pointerup", onPointerUp, true);
-			window.removeEventListener("pointercancel", onPointerCancel, true);
-			window.removeEventListener("wheel", onWheel, true);
-			window.removeEventListener("keydown", onKeyDown, true);
-
-			canvas.remove();
-
-			delete window.__imguiOverlay;
-
-			log("Overlay destroyed.");
-		}
-	};
-
-	window.__imguiOverlay = api;
-
-	// ============================================
-	// Start
-	// ============================================
-
-	animationFrame = requestAnimationFrame(render);
-
-	log("Initialized!");
-	log("Press INSERT to toggle.");
-	log("API: window.__imguiOverlay");
+	initialize().catch(() => {});
 })();
